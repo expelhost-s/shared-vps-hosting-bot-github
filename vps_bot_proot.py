@@ -8,7 +8,7 @@ PROOT edition: runs INSIDE a Docker-container VPS (no docker / LXC / root-on-hos
 * Needs: python3, proot (apt install proot), curl/tar. Token from .env -> DISCORD_TOKEN=...
 * VPS processes survive bot restarts; the bot auto-starts VPS after the host/container restarts.
 """
-import asyncio, os, platform, re, secrets, shutil, signal, sqlite3, time, urllib.request, uuid, logging
+import asyncio, os, platform, re, secrets, shutil, signal, socket, sqlite3, tarfile, time, urllib.request, uuid, logging
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -29,10 +29,38 @@ LIVE_INTERVAL = max(3, int(os.getenv("LIVE_INTERVAL", "5")))   # seconds between
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_VPS_LIMIT", "3"))       # default max VPS per user (admins exempt)
 DISK_DIR = os.getenv("DISK_DIR", "/var/lib/vpsbot")
 DB_PATH = os.getenv("DB_PATH", "vpsbot.db")
+def _hardlinks_native():
+    """proot's --link2symlink can corrupt dpkg (status file vanishes). Only use it when the disk really can't hard-link.
+    Override with PROOT_L2S=1 (force on) or PROOT_L2S=0 (force off)."""
+    mode = os.getenv("PROOT_L2S", "auto").strip().lower()
+    if mode in ("1", "on", "yes", "true"):
+        return False
+    if mode in ("0", "off", "no", "false"):
+        return True
+    a = f"{DISK_DIR}/.hl_probe_{os.getpid()}"
+    b = a + "_b"
+    try:
+        os.makedirs(DISK_DIR, exist_ok=True)
+        open(a, "w").close()
+        os.link(a, b)
+        return True
+    except OSError:
+        return False
+    finally:
+        for f in (a, b):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+NATIVE_HL = _hardlinks_native()
+
 OS_OPTIONS = [("Ubuntu 22.04", "ubuntu:22.04"), ("Ubuntu 24.04", "ubuntu:24.04")]
 START_TIME = time.time()
 log = logging.getLogger("vpsbot")
 logging.basicConfig(level=logging.INFO)
+log.info("native hard links on %s: %s (proot --link2symlink %s)", DISK_DIR, NATIVE_HL, "OFF" if NATIVE_HL else "ON")
 
 # ───────────────────────────── database ─────────────────────────────
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -52,6 +80,10 @@ except sqlite3.OperationalError:
     pass
 try:  # remembers the DM control-panel message so its buttons keep working after a restart
     db.execute("ALTER TABLE vps ADD COLUMN dm_msg INTEGER")
+except sqlite3.OperationalError:
+    pass
+try:  # container hostname: expelhost-<username>-<id>
+    db.execute("ALTER TABLE vps ADD COLUMN hostname TEXT")
 except sqlite3.OperationalError:
     pass
 if not db.execute("SELECT 1 FROM nodes").fetchone():
@@ -147,7 +179,7 @@ def rootfs(v):
 
 
 def proot_cmd(v, *cmd, kill_on_exit=False):
-    c = [PROOT, "--link2symlink", "-0"]
+    c = [PROOT] + ([] if NATIVE_HL else ["--link2symlink"]) + ["-0"]
     if kill_on_exit:
         c.append("--kill-on-exit")
     return c + ["-r", rootfs(v), "-b", "/dev", "-b", "/proc", "-b", "/sys", "-w", "/root", *cmd]
@@ -157,7 +189,7 @@ def penv(v):
     # VPSBOT=<name> is inherited by every process inside the VPS -> that is how we find/kill them
     return {"HOME": "/root", "USER": "root", "LOGNAME": "root", "TERM": "xterm-256color", "LANG": "C.UTF-8",
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin",
-            "VPSBOT": cname(v), "PROOT_NO_SECCOMP": "1", "DEBIAN_FRONTEND": "noninteractive",
+            "VPSBOT": cname(v), "HOSTNAME": hostname_of(v), "PROOT_NO_SECCOMP": "1", "DEBIAN_FRONTEND": "noninteractive",
             "PROOT_TMP_DIR": f"{vdir(v)}/tmp"}
 
 
@@ -233,6 +265,92 @@ def _fetch_tar_sync(ver):
     return dest
 
 
+def hostname_of(v):
+    try:
+        h = v["hostname"]
+    except (KeyError, IndexError):
+        h = None
+    return h or f"expelhost-{v['id']}"
+
+
+def make_hostname(name, vid):
+    u = re.sub(r"[^a-z0-9]", "", (name or "").lower())[:20] or "user"
+    return f"expelhost-{u}-{vid}"
+
+
+IDENT_BEGIN = "# >>> expelhost identity >>>"
+IDENT_END = "# <<< expelhost identity <<<"
+
+
+def _identity_sync(v):
+    """proot cannot change the kernel hostname, so the prompt, /etc/hostname and `hostname` are set inside the rootfs."""
+    r, h = rootfs(v), hostname_of(v)
+    os.makedirs(f"{r}/etc", exist_ok=True)
+    os.makedirs(f"{r}/usr/local/bin", exist_ok=True)
+    os.makedirs(f"{r}/root", exist_ok=True)
+    open(f"{r}/etc/hostname", "w").write(h + "\n")
+    open(f"{r}/etc/hosts", "w").write(f"127.0.0.1 localhost {h}\n::1 localhost\n")
+    w = f"{r}/usr/local/bin/hostname"
+    if os.path.lexists(w):
+        os.remove(w)
+    open(w, "w").write(f"#!/bin/sh\necho {h}\n")
+    os.chmod(w, 0o755)
+    block = (IDENT_BEGIN + "\nexport HOSTNAME=" + h + "\n"
+             "case $- in *i*) PS1='${debian_chroot:+($debian_chroot)}\\u@" + h + ":\\w\\$ ';; esac\n" + IDENT_END + "\n")
+    rc = f"{r}/root/.bashrc"
+    try:
+        txt = open(rc, errors="replace").read()
+    except OSError:
+        txt = ""
+    txt = re.sub(re.escape(IDENT_BEGIN) + r".*?" + re.escape(IDENT_END) + r"\n?", "", txt, flags=re.S)
+    open(rc, "w").write(txt.rstrip("\n") + "\n" + block)
+
+
+def _heal_dpkg_sync(v):
+    """Restore /var/lib/dpkg/status if it vanished (apt: 'flAbsPath on /var/lib/dpkg/status failed')."""
+    r = rootfs(v)
+    d = f"{r}/var/lib/dpkg"
+    st = f"{d}/status"
+    if not os.path.isdir(d):
+        return False
+    if os.path.exists(st) and os.path.getsize(st) > 0:
+        return False
+    if os.path.lexists(st):
+        os.remove(st)
+    for src in (f"{d}/status-old", f"{r}/var/backups/dpkg.status.0"):
+        try:
+            if os.path.isfile(src) and os.path.getsize(src) > 0:
+                shutil.copyfile(src, st)
+                log.warning("restored dpkg status of %s from %s", v["id"], os.path.basename(src))
+                return True
+        except OSError:
+            pass
+    try:   # last resort: the pristine status file from the cached ubuntu-base tarball
+        tb = _latest_tar(v["image"].split(":")[1])
+        if tb:
+            with tarfile.open(tb) as t:
+                for name in ("./var/lib/dpkg/status", "var/lib/dpkg/status"):
+                    try:
+                        m = t.getmember(name)
+                    except KeyError:
+                        continue
+                    with t.extractfile(m) as src, open(st, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    log.warning("restored dpkg status of %s from base tarball", v["id"])
+                    return True
+    except Exception:
+        log.exception("tarball dpkg restore failed")
+    open(st, "w").close()
+    log.warning("created empty dpkg status for %s", v["id"])
+    return True
+
+
+def _prepare_sync(v):
+    if os.path.isdir(rootfs(v)):
+        _heal_dpkg_sync(v)
+        _identity_sync(v)
+
+
 def _configure_sync(v):
     r, n = rootfs(v), cname(v)
     os.makedirs(f"{vdir(v)}/tmp", exist_ok=True)
@@ -242,8 +360,7 @@ def _configure_sync(v):
     if os.path.lexists(rc):
         os.remove(rc)
     open(rc, "w").write("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
-    open(f"{r}/etc/hostname", "w").write(n + "\n")
-    open(f"{r}/etc/hosts", "w").write(f"127.0.0.1 localhost {n}\n::1 localhost\n")
+    _identity_sync(v)
     os.makedirs(f"{r}/etc/apt/apt.conf.d", exist_ok=True)
     open(f"{r}/etc/apt/apt.conf.d/99proot", "w").write('APT::Sandbox::User "root";\nAcquire::Retries "3";\n')
     os.makedirs(f"{r}/etc/dpkg/dpkg.cfg.d", exist_ok=True)
@@ -257,20 +374,35 @@ SETUP_SH = r"""
 export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true
 LOG=/tmp/setup.log
 : >"$LOG"
+# probe: can this filesystem/proot make hard links? (dpkg needs it for status-old)
+touch /tmp/.hl_a 2>/dev/null; rm -f /tmp/.hl_b
+ln /tmp/.hl_a /tmp/.hl_b 2>>"$LOG" || echo "SETUP_NOTE:hardlink-in-/tmp-failed" >&2
+rm -f /tmp/.hl_a /tmp/.hl_b
+heal() {
+  if [ ! -s /var/lib/dpkg/status ]; then
+    rm -f /var/lib/dpkg/status
+    if [ -s /var/lib/dpkg/status-old ]; then cp -f /var/lib/dpkg/status-old /var/lib/dpkg/status; else : > /var/lib/dpkg/status; fi
+  fi
+}
+heal
 APT="apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Install-Recommends=false"
 {
+  heal
   apt-get update -qq || apt-get update -qq
   $APT install apt-utils || true
   dpkg --configure -a || true
   $APT -f install || true
   # install one by one so a single broken postinst can't take everything down with it
   for p in ca-certificates curl wget sudo nano git tmux procps iputils-ping net-tools bsdutils; do
+    heal
     if ! $APT install $p; then
+      heal
       dpkg --configure -a || true
       $APT -f install || true
       $APT install $p || echo "SETUP_FAILED:$p"
     fi
   done
+  heal
   dpkg --configure -a || true
 } >>"$LOG" 2>&1
 command -v curl >/dev/null 2>&1 && { curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; }
@@ -283,14 +415,7 @@ SSHX_SH = r'''
 export PATH="$PATH:/root/.local/bin:/usr/local/bin"
 export DEBIAN_FRONTEND=noninteractive
 LOG=@LOG@
-# self-heal: install curl (and friends) if the initial setup failed or was skipped
-if ! command -v curl >/dev/null 2>&1; then
-  APTLOG=/tmp/apt_fix.log
-  { apt-get update -qq && apt-get install -y -qq curl ca-certificates procps bsdutils; } >"$APTLOG" 2>&1 \
-    || { tail -n 4 "$APTLOG" >&2; echo "sshx install failed: could not install curl" >&2; exit 2; }
-fi
-command -v sshx >/dev/null 2>&1 || curl -sSf https://sshx.io/get | sh >/dev/null 2>&1
-command -v sshx >/dev/null 2>&1 || { echo "sshx install failed" >&2; exit 2; }
+command -v sshx >/dev/null 2>&1 || { echo "sshx install failed: binary missing" >&2; exit 2; }
 if command -v script >/dev/null 2>&1; then
   setsid nohup script -qfc "sshx -q" "$LOG" </dev/null >/dev/null 2>&1 &
 else
@@ -307,6 +432,7 @@ echo "timed out waiting for sshx" >&2; exit 1
 
 async def stop_vps(v):
     n = cname(v)
+    await close_console(v)
     pids = (await scan(0)).get(n, [])
     for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
         for p in pids:
@@ -327,6 +453,7 @@ async def stop_vps(v):
 
 async def start_vps(v):
     n = cname(v)
+    await asyncio.to_thread(_prepare_sync, v)
     if (await scan(0)).get(n):
         return
     if not os.path.isdir(rootfs(v)):
@@ -356,6 +483,7 @@ async def destroy(v):
 def _setup_warning(v, rc, stderr):
     """Summarise the real cause of a package-setup problem (ignores harmless debconf noise)."""
     failed = re.findall(r"SETUP_FAILED:(\S+)", stderr or "")
+    notes = re.findall(r"SETUP_NOTE:(\S+)", stderr or "")
     log = ""
     try:
         log = open(f"{rootfs(v)}/tmp/setup.log", errors="replace").read()
@@ -365,13 +493,15 @@ def _setup_warning(v, rc, stderr):
     lines = [l for l in log.splitlines()
              if re.search(r"(^E:|error processing|returned an error|dpkg: error|failed|Errors were)", l, re.I)
              and not any(n in l for n in noise)]
-    if not failed and not lines:
+    if not failed and not lines and not notes:
         return ""
     msg = "Package setup had issues"
     if failed:
         msg += " (could not install: " + ", ".join(failed) + ")"
     if lines:
         msg += ": " + " | ".join(lines[-3:])[:300]
+    if notes:
+        msg += "\nProbe: " + ", ".join(notes)
     return msg + "\nFull log: `/tmp/setup.log` inside the VPS."
 
 
@@ -476,6 +606,10 @@ async def _info(v):
 
 async def sshx_link(v):
     n = cname(v)
+    try:
+        await asyncio.to_thread(_ensure_sshx_sync, v)
+    except Exception as e:
+        raise RuntimeError(f"sshx install failed: could not download sshx ({e})")
     tag = secrets.token_hex(4)
     out_path = f"{vdir(v)}/tmp/sshx_out_{tag}.log"
     script = SSHX_SH.replace("@LOG@", f"/tmp/sshx_{tag}.log")
@@ -505,6 +639,191 @@ async def sshx_link(v):
     if not link:
         raise RuntimeError(txt.strip()[-300:] or "no link returned")
     return link
+
+# ───────────────────────────── web console (ttyd + tunnel) ─────────────────────────────
+# Works in a plain Docker container: no apt, no curl, no privileges. Static binaries are downloaded by the BOT
+# (host side), ttyd runs inside the VPS, and a tunnel (Cloudflare quick tunnel, then Pinggy) exposes it over HTTPS.
+BIN_DIR = f"{DISK_DIR}/cache/bin"
+_UA = {"User-Agent": "Mozilla/5.0 (vpsbot)"}
+BIN_SRC = {
+    "ttyd": {"amd64": "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64",
+             "arm64": "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.aarch64"},
+    "cloudflared": {"amd64": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+                    "arm64": "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"},
+}
+SSHX_SRC = {"amd64": "https://s3.amazonaws.com/sshx/sshx-x86_64-unknown-linux-musl.tar.gz",
+            "arm64": "https://s3.amazonaws.com/sshx/sshx-aarch64-unknown-linux-musl.tar.gz"}
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+CONSOLES = {}      # cname -> list of processes (ttyd + tunnel) of the current web console
+
+
+def _download(url, dest):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=180) as r, open(dest + ".part", "wb") as f:
+        shutil.copyfileobj(r, f)
+    os.replace(dest + ".part", dest)
+
+
+def _host_bin_sync(name):
+    path = f"{BIN_DIR}/{name}"
+    if not os.path.isfile(path):
+        url = BIN_SRC[name].get(ARCH)
+        if not url:
+            raise RuntimeError(f"no {name} build for {ARCH}")
+        _download(url, path)
+    os.chmod(path, 0o755)
+    return path
+
+
+def _vps_bin_sync(v, name):
+    src = _host_bin_sync(name)
+    dst = f"{rootfs(v)}/usr/local/bin/{name}"
+    if not os.path.isfile(dst):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+    os.chmod(dst, 0o755)
+    return dst
+
+
+def _ensure_sshx_sync(v):
+    dst = f"{rootfs(v)}/usr/local/bin/sshx"
+    if os.path.isfile(dst):
+        return
+    url = SSHX_SRC.get(ARCH)
+    if not url:
+        raise RuntimeError(f"no sshx build for {ARCH}")
+    tgz = f"{BIN_DIR}/sshx.tar.gz"
+    if not os.path.isfile(tgz):
+        _download(url, tgz)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with tarfile.open(tgz) as t:
+        m = next((m for m in t.getmembers() if m.isfile() and os.path.basename(m.name) == "sshx"), None)
+        if not m:
+            raise RuntimeError("sshx archive has no binary")
+        with t.extractfile(m) as src, open(dst, "wb") as out:
+            shutil.copyfileobj(src, out)
+    os.chmod(dst, 0o755)
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+async def _kill_proc(p):
+    if p is None or p.returncode is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.send_signal(sig)
+            except ProcessLookupError:
+                return
+        try:
+            await asyncio.wait_for(p.wait(), 3)
+            return
+        except asyncio.TimeoutError:
+            continue
+
+
+async def close_console(v):
+    for p in CONSOLES.pop(cname(v), []):
+        await _kill_proc(p)
+
+
+async def _spawn_tunnel(cmd, pattern, log_path, wait=45):
+    out = open(log_path, "wb")
+    p = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.DEVNULL, stdout=out, stderr=out,
+                                             start_new_session=True)
+    out.close()
+    txt = ""
+    for _ in range(int(wait * 2)):
+        await asyncio.sleep(0.5)
+        try:
+            txt = ANSI_RE.sub("", open(log_path, errors="replace").read())
+        except OSError:
+            txt = ""
+        m = re.search(pattern, txt)
+        if m:
+            return p, m.group(0), txt
+        if p.returncode is not None:
+            break
+    return p, None, txt
+
+
+async def console_link(v):
+    """Start a password-protected web terminal for the VPS and return {'url','user','pw','via'}."""
+    n = cname(v)
+    await close_console(v)
+    try:
+        await asyncio.to_thread(_vps_bin_sync, v, "ttyd")
+    except Exception as e:
+        raise RuntimeError(f"could not download ttyd: {e}")
+    os.makedirs(f"{vdir(v)}/tmp", exist_ok=True)
+    port, user, pw = _free_port(), "vps", secrets.token_urlsafe(9)
+    tlog = f"{vdir(v)}/tmp/ttyd.log"
+    lf = open(tlog, "wb")
+    ttyd = await asyncio.create_subprocess_exec(
+        *proot_cmd(v, "/usr/local/bin/ttyd", "-W", "-i", "lo", "-p", str(port), "-c", f"{user}:{pw}", "/bin/bash", "-l",
+                   kill_on_exit=True),
+        env=penv(v), stdin=asyncio.subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True)
+    lf.close()
+    procs = [ttyd]
+    up = False
+    for _ in range(40):
+        await asyncio.sleep(0.25)
+        if ttyd.returncode is not None:
+            break
+        try:
+            with socket.create_connection(("127.0.0.1", port), 0.5):
+                up = True
+                break
+        except OSError:
+            pass
+    if not up:
+        tail = ANSI_RE.sub("", open(tlog, errors="replace").read())[-250:]
+        await _kill_proc(ttyd)
+        raise RuntimeError(f"web terminal did not start: {tail or 'no output'}")
+
+    errors, url, via = [], None, None
+    try:   # 1) Cloudflare quick tunnel (HTTPS, no account)
+        cf = await asyncio.to_thread(_host_bin_sync, "cloudflared")
+        p, u, txt = await _spawn_tunnel([cf, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate",
+                                         "--protocol", "http2"], r"https://[a-z0-9-]+\.trycloudflare\.com",
+                                        f"{vdir(v)}/tmp/cf.log", 45)
+        if u:
+            procs.append(p)
+            url, via = u, "Cloudflare"
+        else:
+            await _kill_proc(p)
+            errors.append("cloudflare: " + (txt.strip().splitlines() or ["no url"])[-1][:120])
+    except Exception as e:
+        errors.append(f"cloudflare: {e}"[:150])
+    if not url:   # 2) Pinggy (needs an ssh client on the bot's machine)
+        if shutil.which("ssh"):
+            p, u, txt = await _spawn_tunnel(
+                ["ssh", "-p", "443", f"-R0:127.0.0.1:{port}", "-o", "StrictHostKeyChecking=no",
+                 "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=30",
+                 "-o", "ExitOnForwardFailure=yes", "a.pinggy.io"],
+                r"https://[A-Za-z0-9.-]+\.pinggy\.link", f"{vdir(v)}/tmp/pinggy.log", 30)
+            if u:
+                procs.append(p)
+                url, via = u, "Pinggy"
+            else:
+                await _kill_proc(p)
+                errors.append("pinggy: " + (txt.strip().splitlines() or ["no url"])[-1][:120])
+        else:
+            errors.append("pinggy: no ssh client on the bot machine (apt install openssh-client)")
+    if not url:
+        await _kill_proc(ttyd)
+        raise RuntimeError("no tunnel could start - " + " | ".join(errors))
+    CONSOLES[n] = procs
+    return {"url": url, "user": user, "pw": pw, "via": via}
+
 
 # ───────────────────────────── formatting ─────────────────────────────
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -571,6 +890,7 @@ async def build_panel(v, frame=None):
     if live:
         desc += f"{'🔴' if f % 2 == 0 else '⚫'} **LIVE** • updates every {LIVE_INTERVAL}s\n\n"
     desc += (f"**VPS No:** `{vps_number(v)}` | **ID:** `{v['id']}`\n"
+             f"**Hostname:** `{hostname_of(v)}`\n"
              f"**OS:** `{dict((b, a) for a, b in OS_OPTIONS).get(v['image'], v['image'])}`\n\n"
              f"**Status:** {status}\n**Uptime:** `{up}`\n**Expires:** `{fmt_exp(v)}`\n\n")
     if st == "running":
@@ -768,8 +1088,9 @@ async def deploy_flow(ctx, owner, ram, cpu, disk, free=False, days=None):
     vid = uuid.uuid4().hex[:8]
     days = EXPIRY_DAYS if days is None else days
     exp = (now() + timedelta(days=days)).isoformat() if days else None
-    ex("INSERT INTO vps(id,owner,node_id,image,ram,cpu,disk,created,expires,free) VALUES(?,?,?,?,?,?,?,?,?,?)",
-       vid, owner.id, node_id, image, ram, cpu, disk, now().isoformat(), exp, 1 if free else 0)
+    ex("INSERT INTO vps(id,owner,node_id,image,ram,cpu,disk,created,expires,free,hostname) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+       vid, owner.id, node_id, image, ram, cpu, disk, now().isoformat(), exp, 1 if free else 0,
+       make_hostname(owner.name, vid))
     v = get_vps(vid)
     msg = await ctx.send(embed=simple("⏳ Creating VPS", "Starting…"))
 
@@ -787,7 +1108,7 @@ async def deploy_flow(ctx, owner, ram, cpu, disk, free=False, days=None):
     det = discord.Embed(title="🌟 VPS Created Successfully", color=0x2ECC71)
     det.add_field(name="➤ Owner", value=owner.mention, inline=True)
     det.add_field(name="➤ VPS No / ID", value=f"#{vps_number(v)} • `{vid}`", inline=True)
-    det.add_field(name="➤ Container", value=f"`{cname(v)}`", inline=True)
+    det.add_field(name="➤ Hostname", value=f"`{hostname_of(v)}`", inline=True)
     det.add_field(name="➤ Node", value=get_node(v["node_id"])["name"], inline=False)
     det.add_field(name="➤ Resources", value=f"**RAM:** {ram} GB (shared)\n**CPU:** {cpu} Cores (shared)\n"
                                            f"**Storage:** {disk} GB ({v['mode']})", inline=False)
@@ -950,6 +1271,19 @@ class Panel(discord.ui.View):
             except discord.Forbidden:
                 return await i.followup.send("❌ I can't DM you. Enable **Direct Messages** from server members and press **SSHX** again.", ephemeral=True)
             await i.followup.send("📩 Your SSHX link was sent to your **DMs**.", ephemeral=True)
+        elif action == "console":
+            await i.response.defer(ephemeral=True, thinking=True)
+            if (await info(v))["state"] != "running":
+                return await i.followup.send("❌ VPS is not running. Press **Start** first.", ephemeral=True)
+            c = await console_link(v)
+            try:   # credentials are private: DM only
+                await i.user.send(embed=simple(f"🖥️ Web Console • VPS {v['id']}",
+                                               f"**Open:** {c['url']}\n**Username:** `{c['user']}`\n**Password:** `{c['pw']}`\n\n"
+                                               f"Via {c['via']}. The link stops working when you press **Console** again or stop the VPS.", 0x2ECC71))
+            except discord.Forbidden:
+                await close_console(v)
+                return await i.followup.send("❌ I can't DM you. Enable **Direct Messages** from server members and press **Console** again.", ephemeral=True)
+            await i.followup.send("📩 Your console link and login were sent to your **DMs**.", ephemeral=True)
         elif action == "reinstall":
             pv = Picker(i.user.id, "Select new OS", os_options())
             await i.response.send_message("🐧 **Reinstall — choose the new OS** (all data will be wiped):", view=pv, ephemeral=True)
@@ -1000,6 +1334,10 @@ class Panel(discord.ui.View):
     async def b_sshx(self, i, b):
         await self.act(i, "sshx")
 
+    @discord.ui.button(custom_id="vp_console", label="Console", emoji="🖥️", style=discord.ButtonStyle.secondary, row=1)
+    async def b_console(self, i, b):
+        await self.act(i, "console")
+
     @discord.ui.button(custom_id="vp_reinstall", label="Reinstall", emoji="🔴", style=discord.ButtonStyle.secondary, row=1)
     async def b_reinstall(self, i, b):
         await self.act(i, "reinstall")
@@ -1047,6 +1385,18 @@ async def on_ready():
     except FileNotFoundError:
         rc, o, e = 1, "", "proot not found - run: apt install proot"
     log.info("Logged in as %s | proot: %s", bot.user, o.splitlines()[0] if rc == 0 and o else f"ERROR {e}")
+    for r in q("SELECT id, owner FROM vps WHERE hostname IS NULL OR hostname=''"):
+        try:
+            u = bot.get_user(r["owner"]) or await bot.fetch_user(r["owner"])
+            nm = u.name
+        except Exception:
+            nm = None
+        ex("UPDATE vps SET hostname=? WHERE id=?", make_hostname(nm, r["id"]), r["id"])
+    for r in q("SELECT * FROM vps"):
+        try:
+            await asyncio.to_thread(_prepare_sync, r)
+        except Exception:
+            log.exception("prepare %s failed", r["id"])
     for r in q("SELECT * FROM vps WHERE up=1"):          # bring VPS back after a host/container restart
         if not expired(r) and os.path.isdir(rootfs(r)):
             try:

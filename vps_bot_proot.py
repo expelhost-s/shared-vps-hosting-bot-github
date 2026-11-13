@@ -253,9 +253,31 @@ def _configure_sync(v):
     os.chmod(f"{r}/usr/sbin/policy-rc.d", 0o755)
 
 
-SETUP_SH = ("export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && "
-            "apt-get install -y -qq curl ca-certificates sudo nano wget git tmux procps iputils-ping net-tools bsdutils "
-            ">/dev/null && { curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; }")
+SETUP_SH = r"""
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true
+LOG=/tmp/setup.log
+: >"$LOG"
+APT="apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Install-Recommends=false"
+{
+  apt-get update -qq || apt-get update -qq
+  $APT install apt-utils || true
+  dpkg --configure -a || true
+  $APT -f install || true
+  # install one by one so a single broken postinst can't take everything down with it
+  for p in ca-certificates curl wget sudo nano git tmux procps iputils-ping net-tools bsdutils; do
+    if ! $APT install $p; then
+      dpkg --configure -a || true
+      $APT -f install || true
+      $APT install $p || echo "SETUP_FAILED:$p"
+    fi
+  done
+  dpkg --configure -a || true
+} >>"$LOG" 2>&1
+command -v curl >/dev/null 2>&1 && { curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; }
+grep -h '^SETUP_FAILED:' "$LOG" >&2
+exit 0
+"""
+
 
 SSHX_SH = r'''
 export PATH="$PATH:/root/.local/bin:/usr/local/bin"
@@ -331,6 +353,28 @@ async def destroy(v):
     await run("rm", "-rf", vdir(v), timeout=600)
 
 
+def _setup_warning(v, rc, stderr):
+    """Summarise the real cause of a package-setup problem (ignores harmless debconf noise)."""
+    failed = re.findall(r"SETUP_FAILED:(\S+)", stderr or "")
+    log = ""
+    try:
+        log = open(f"{rootfs(v)}/tmp/setup.log", errors="replace").read()
+    except OSError:
+        pass
+    noise = ("debconf:", "apt-utils", "dpkg-preconfigure", "Selecting previously", "Reading ", "Building ")
+    lines = [l for l in log.splitlines()
+             if re.search(r"(^E:|error processing|returned an error|dpkg: error|failed|Errors were)", l, re.I)
+             and not any(n in l for n in noise)]
+    if not failed and not lines:
+        return ""
+    msg = "Package setup had issues"
+    if failed:
+        msg += " (could not install: " + ", ".join(failed) + ")"
+    if lines:
+        msg += ": " + " | ".join(lines[-3:])[:300]
+    return msg + "\nFull log: `/tmp/setup.log` inside the VPS."
+
+
 async def provision(v, progress, fresh=True):
     """Download Ubuntu rootfs, unpack, configure, start and install tools. Returns a warning string or ''."""
     if not fresh:
@@ -350,7 +394,7 @@ async def provision(v, progress, fresh=True):
     await progress("⚙️ Installing packages & SSHX (can take a few minutes under proot)…")
     rc, _, e = await run(*proot_cmd(v, "/bin/bash", "-c", SETUP_SH, kill_on_exit=True), timeout=1500, env=penv(v))
     await start_vps(v)
-    return "" if rc == 0 else f"Package setup had issues: {e[-300:]}"
+    return await asyncio.to_thread(_setup_warning, v, rc, e)
 
 
 async def lifecycle(v, action):

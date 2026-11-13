@@ -255,11 +255,18 @@ def _configure_sync(v):
 
 SETUP_SH = ("export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && "
             "apt-get install -y -qq curl ca-certificates sudo nano wget git tmux procps iputils-ping net-tools bsdutils "
-            ">/dev/null && curl -sSf https://sshx.io/get | sh >/dev/null 2>&1; true")
+            ">/dev/null && { curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; }")
 
 SSHX_SH = r'''
 export PATH="$PATH:/root/.local/bin:/usr/local/bin"
+export DEBIAN_FRONTEND=noninteractive
 LOG=@LOG@
+# self-heal: install curl (and friends) if the initial setup failed or was skipped
+if ! command -v curl >/dev/null 2>&1; then
+  APTLOG=/tmp/apt_fix.log
+  { apt-get update -qq && apt-get install -y -qq curl ca-certificates procps bsdutils; } >"$APTLOG" 2>&1 \
+    || { tail -n 4 "$APTLOG" >&2; echo "sshx install failed: could not install curl" >&2; exit 2; }
+fi
 command -v sshx >/dev/null 2>&1 || curl -sSf https://sshx.io/get | sh >/dev/null 2>&1
 command -v sshx >/dev/null 2>&1 || { echo "sshx install failed" >&2; exit 2; }
 if command -v script >/dev/null 2>&1; then

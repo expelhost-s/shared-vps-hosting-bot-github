@@ -8,7 +8,7 @@ PROOT edition: runs INSIDE a Docker-container VPS (no docker / LXC / root-on-hos
 * Needs: python3, proot (apt install proot), curl/tar. Token from .env -> DISCORD_TOKEN=...
 * VPS processes survive bot restarts; the bot auto-starts VPS after the host/container restarts.
 """
-import asyncio, os, platform, re, secrets, shutil, signal, socket, sqlite3, tarfile, time, urllib.request, uuid, logging
+import asyncio, os, platform, re, secrets, shutil, signal, socket, sqlite3, subprocess, tarfile, time, urllib.request, uuid, logging
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -178,9 +178,22 @@ def rootfs(v):
     return f"{vdir(v)}/rootfs"
 
 
+def _proot_supports(flag):
+    """Old proot builds (e.g. apt's 5.1.0) reject --kill-on-exit, so probe --help once."""
+    try:
+        r = subprocess.run([PROOT, "--help"], capture_output=True, text=True, timeout=15)
+        return flag in (r.stdout + r.stderr)
+    except Exception:
+        return False
+
+
+KILL_ON_EXIT_OK = _proot_supports("--kill-on-exit")
+log.info("proot --kill-on-exit supported: %s", KILL_ON_EXIT_OK)
+
+
 def proot_cmd(v, *cmd, kill_on_exit=False):
     c = [PROOT] + ([] if NATIVE_HL else ["--link2symlink"]) + ["-0"]
-    if kill_on_exit:
+    if kill_on_exit and KILL_ON_EXIT_OK:
         c.append("--kill-on-exit")
     return c + ["-r", rootfs(v), "-b", "/dev", "-b", "/proc", "-b", "/sys", "-w", "/root", *cmd]
 
